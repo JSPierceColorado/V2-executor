@@ -4,11 +4,13 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, time as dt_time, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any, Dict, List, Optional, Set, Tuple
+from zoneinfo import ZoneInfo
 
 import gspread
 from alpaca.trading.client import TradingClient
@@ -16,7 +18,12 @@ from alpaca.trading.enums import OrderSide, QueryOrderStatus, TimeInForce
 from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest
 from fastapi import FastAPI, HTTPException
 
-APP_VERSION = "0.1.0-dry-run-first-draft"
+try:
+    from alpaca.trading.enums import PositionIntent
+except Exception:  # Older alpaca-py versions may not expose this enum.
+    PositionIntent = None  # type: ignore[assignment]
+
+APP_VERSION = "0.2.0-options-daily-guard-no-sheet-log"
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -28,7 +35,6 @@ app = FastAPI(title="Executor", version=APP_VERSION)
 
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
 MANAGER_TAB_NAME = os.getenv("MANAGER_TAB_NAME", "Manager").strip() or "Manager"
-LOG_TAB_NAME = os.getenv("EXECUTOR_LOG_TAB_NAME", "ExecutorLog").strip() or "ExecutorLog"
 
 LOOP_ENABLED = os.getenv("LOOP_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
 EXECUTOR_LOOP_INTERVAL_SECONDS = int(os.getenv("EXECUTOR_LOOP_INTERVAL_SECONDS", "300"))
@@ -36,10 +42,10 @@ EXECUTOR_LOOP_INITIAL_DELAY_SECONDS = int(os.getenv("EXECUTOR_LOOP_INITIAL_DELAY
 MIN_LOOP_INTERVAL_SECONDS = int(os.getenv("MIN_LOOP_INTERVAL_SECONDS", "60"))
 DRY_RUN = os.getenv("DRY_RUN", "true").strip().lower() not in {"0", "false", "no", "off"}
 
-# V1 is stock-safe by default. Add us_option explicitly only after you are ready.
+# This draft intentionally allows both the future plain-stock case and the current option case.
 ALLOWED_ASSET_CLASSES = {
     item.strip().lower()
-    for item in os.getenv("EXECUTOR_ALLOWED_ASSET_CLASSES", "us_equity").split(",")
+    for item in os.getenv("EXECUTOR_ALLOWED_ASSET_CLASSES", "us_equity,us_option").split(",")
     if item.strip()
 }
 
@@ -47,6 +53,17 @@ MAX_ORDERS_PER_CYCLE = int(os.getenv("MAX_ORDERS_PER_CYCLE", "10"))
 MAX_QTY_DECIMALS = int(os.getenv("MAX_QTY_DECIMALS", "6"))
 REQUIRE_DATA_STATUS_OK = os.getenv("REQUIRE_DATA_STATUS_OK", "true").strip().lower() not in {"0", "false", "no", "off"}
 REQUIRE_STILL_RED = os.getenv("REQUIRE_STILL_RED", "true").strip().lower() not in {"0", "false", "no", "off"}
+
+# Once this bot, another bot, or a manual action has submitted a same-day sell order for a symbol,
+# this bot will not submit another size-changing order for that symbol that same trading day.
+DAILY_ACTION_GUARD_ENABLED = os.getenv("DAILY_ACTION_GUARD_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+DAILY_ACTION_TZ = os.getenv("DAILY_ACTION_TZ", "America/New_York").strip() or "America/New_York"
+ORDER_LOOKBACK_LIMIT = int(os.getenv("ORDER_LOOKBACK_LIMIT", "500"))
+
+# Options are whole-contract instruments. With this enabled, a REDUCE signal on a 1-contract option
+# can sell 1 contract, which fully exits the position. That is intentional.
+OPTION_REDUCE_SELL_AT_LEAST_ONE = os.getenv("OPTION_REDUCE_SELL_AT_LEAST_ONE", "true").strip().lower() not in {"0", "false", "no", "off"}
+OPTION_POSITION_INTENT_STC = os.getenv("OPTION_POSITION_INTENT_STC", "true").strip().lower() not in {"0", "false", "no", "off"}
 
 MANAGER_REQUIRED_HEADERS = [
     "symbol",
@@ -60,22 +77,14 @@ MANAGER_REQUIRED_HEADERS = [
     "data_status",
 ]
 
-LOG_HEADERS = [
-    "timestamp",
-    "symbol",
-    "action",
-    "reduce_pct",
-    "qty_before",
-    "qty_to_sell",
-    "asset_class",
-    "unrealized_pct",
-    "data_status",
-    "status",
-    "order_id",
-    "reason",
-    "error",
-    "dry_run",
-]
+NO_EFFECT_ORDER_STATUSES = {
+    "canceled",
+    "cancelled",
+    "expired",
+    "rejected",
+    "stopped",
+    "suspended",
+}
 
 state_lock = threading.Lock()
 cycle_lock = asyncio.Lock()
@@ -115,7 +124,6 @@ def as_float(value: Any, default: Optional[float] = None) -> Optional[float]:
         return default
     if math.isnan(number) or math.isinf(number):
         return default
-    # Manager stores unrealized_pct as decimal form, not percentage points.
     return number
 
 
@@ -133,6 +141,11 @@ def get_field(obj: Any, name: str, default: Any = None) -> Any:
     if isinstance(obj, dict):
         return obj.get(name, default)
     return getattr(obj, name, default)
+
+
+def enum_value(value: Any) -> str:
+    raw = get_field(value, "value", value)
+    return as_str(raw).lower()
 
 
 def alpaca_trading_client() -> TradingClient:
@@ -158,14 +171,6 @@ def gspread_client() -> gspread.Client:
     return gspread.service_account(filename=credentials_path)
 
 
-def get_or_create_ws(spreadsheet: gspread.Spreadsheet, title: str, rows: int = 100, cols: int = 20) -> gspread.Worksheet:
-    try:
-        return spreadsheet.worksheet(title)
-    except gspread.WorksheetNotFound:
-        logger.info("Creating worksheet tab: %s", title)
-        return spreadsheet.add_worksheet(title=title, rows=rows, cols=cols)
-
-
 def load_manager_rows(ws: gspread.Worksheet) -> List[Dict[str, Any]]:
     values = ws.get_all_values()
     if not values or len(values) < 2:
@@ -186,25 +191,6 @@ def load_manager_rows(ws: gspread.Worksheet) -> List[Dict[str, Any]]:
     return rows
 
 
-def append_log_rows(ws: gspread.Worksheet, log_rows: List[List[Any]]) -> None:
-    if not log_rows:
-        return
-
-    existing = ws.get_all_values()
-    if not existing:
-        ws.update(values=[LOG_HEADERS], range_name="A1", value_input_option="USER_ENTERED")
-        try:
-            ws.freeze(rows=1)
-            ws.format("A1:N1", {"textFormat": {"bold": True}})
-        except Exception:
-            logger.info("Skipping optional ExecutorLog formatting", exc_info=True)
-    elif existing[0][: len(LOG_HEADERS)] != LOG_HEADERS:
-        # Do not destroy user data; append a header marker instead.
-        log_rows = [["HEADER_MISMATCH", *[""] * (len(LOG_HEADERS) - 1)]] + log_rows
-
-    ws.append_rows(log_rows, value_input_option="USER_ENTERED")
-
-
 def current_positions_by_symbol(trading: TradingClient) -> Dict[str, Any]:
     positions = trading.get_all_positions()
     result: Dict[str, Any] = {}
@@ -217,18 +203,58 @@ def current_positions_by_symbol(trading: TradingClient) -> Dict[str, Any]:
 
 def open_sell_order_symbols(trading: TradingClient) -> Set[str]:
     try:
-        request = GetOrdersRequest(status=QueryOrderStatus.OPEN)
+        request = GetOrdersRequest(status=QueryOrderStatus.OPEN, side=OrderSide.SELL, limit=ORDER_LOOKBACK_LIMIT)
         orders = trading.get_orders(filter=request)
     except Exception:
-        logger.exception("Could not fetch open orders; failing closed for this cycle")
+        logger.exception("Could not fetch open sell orders; failing closed for this cycle")
         raise
 
     result: Set[str] = set()
     for order in orders:
         symbol = as_str(get_field(order, "symbol")).upper()
-        side = as_str(get_field(order, "side")).lower()
+        side = enum_value(get_field(order, "side"))
         if symbol and side == "sell":
             result.add(symbol)
+    return result
+
+
+def daily_guard_start() -> datetime:
+    try:
+        tz = ZoneInfo(DAILY_ACTION_TZ)
+    except Exception:
+        logger.warning("Invalid DAILY_ACTION_TZ=%s; falling back to America/New_York", DAILY_ACTION_TZ)
+        tz = ZoneInfo("America/New_York")
+    now_local = datetime.now(tz)
+    return datetime.combine(now_local.date(), dt_time.min, tzinfo=tz)
+
+
+def same_day_sell_action_symbols(trading: TradingClient) -> Set[str]:
+    """Return symbols that already had a same-day sell order that could affect position size."""
+    if not DAILY_ACTION_GUARD_ENABLED:
+        return set()
+
+    try:
+        request = GetOrdersRequest(
+            status=QueryOrderStatus.ALL,
+            side=OrderSide.SELL,
+            after=daily_guard_start(),
+            limit=ORDER_LOOKBACK_LIMIT,
+        )
+        orders = trading.get_orders(filter=request)
+    except Exception:
+        logger.exception("Could not fetch same-day sell order history; failing closed for this cycle")
+        raise
+
+    result: Set[str] = set()
+    for order in orders:
+        symbol = as_str(get_field(order, "symbol")).upper()
+        side = enum_value(get_field(order, "side"))
+        status = enum_value(get_field(order, "status"))
+        if not symbol or side != "sell":
+            continue
+        if status in NO_EFFECT_ORDER_STATUSES:
+            continue
+        result.add(symbol)
     return result
 
 
@@ -251,28 +277,72 @@ def decimal_qty_from_position(pos: Any) -> Decimal:
     return qty.copy_abs()
 
 
-def quantize_qty(qty: Decimal) -> Decimal:
+def quantize_equity_qty(qty: Decimal) -> Decimal:
     if qty <= 0:
         return Decimal("0")
     quantum = Decimal("1") if MAX_QTY_DECIMALS <= 0 else Decimal("1").scaleb(-MAX_QTY_DECIMALS)
     return qty.quantize(quantum, rounding=ROUND_DOWN).normalize()
 
 
-def compute_qty_to_sell(qty_before: Decimal, reduce_pct: float, action: str) -> Decimal:
+def quantize_option_qty(qty: Decimal) -> Decimal:
+    if qty <= 0:
+        return Decimal("0")
+    return qty.quantize(Decimal("1"), rounding=ROUND_DOWN)
+
+
+def compute_qty_to_sell(qty_before: Decimal, reduce_pct: float, action: str, asset_class: str) -> Decimal:
+    action = action.upper()
+    asset_class = asset_class.lower()
+
     if action == "EXIT":
         return qty_before
-    if action == "REDUCE":
-        pct = max(0.0, min(100.0, reduce_pct)) / 100.0
-        return quantize_qty(qty_before * Decimal(str(pct)))
-    return Decimal("0")
+    if action != "REDUCE":
+        return Decimal("0")
+
+    pct = max(0.0, min(100.0, reduce_pct)) / 100.0
+    raw_qty = qty_before * Decimal(str(pct))
+
+    if asset_class == "us_option":
+        qty = quantize_option_qty(raw_qty)
+        if OPTION_REDUCE_SELL_AT_LEAST_ONE and reduce_pct > 0 and qty_before >= 1 and qty < 1:
+            qty = Decimal("1")
+        return min(qty, qty_before)
+
+    return min(quantize_equity_qty(raw_qty), qty_before)
 
 
 def manager_asset_class(row: Dict[str, Any]) -> str:
     return as_str(row.get("asset_class")).lower()
 
 
-def evaluate_row(row: Dict[str, Any], positions: Dict[str, Any], blocked_symbols: Set[str]) -> Tuple[str, str, Decimal, Optional[Any]]:
-    """Return status, error/reason, qty_to_sell, position."""
+def safe_client_order_id(symbol: str, action: str, trade_date: str) -> str:
+    clean_symbol = re.sub(r"[^A-Za-z0-9]", "", symbol.upper())[:28]
+    return f"executor-{trade_date}-{clean_symbol}-{action.lower()}"[:48]
+
+
+def today_trade_date_text() -> str:
+    try:
+        tz = ZoneInfo(DAILY_ACTION_TZ)
+    except Exception:
+        tz = ZoneInfo("America/New_York")
+    return datetime.now(tz).date().isoformat().replace("-", "")
+
+
+def option_position_intent_value() -> Optional[Any]:
+    if not OPTION_POSITION_INTENT_STC:
+        return None
+    if PositionIntent is None:
+        return "sell_to_close"
+    return getattr(PositionIntent, "STC", "sell_to_close")
+
+
+def evaluate_row(
+    row: Dict[str, Any],
+    positions: Dict[str, Any],
+    blocked_symbols: Set[str],
+    same_day_action_symbols: Set[str],
+) -> Tuple[str, str, Decimal, Optional[Any]]:
+    """Return status, reason, qty_to_sell, position."""
     symbol = as_str(row.get("symbol")).upper()
     action = as_str(row.get("action")).upper()
     data_status = as_str(row.get("data_status")).upper()
@@ -292,6 +362,8 @@ def evaluate_row(row: Dict[str, Any], positions: Dict[str, Any], blocked_symbols
         return "SKIP", f"asset_class {asset_class or 'blank'} not allowed", Decimal("0"), None
     if symbol in blocked_symbols:
         return "SKIP", "Open sell order already exists", Decimal("0"), None
+    if DAILY_ACTION_GUARD_ENABLED and symbol in same_day_action_symbols:
+        return "SKIP", "Daily action guard: symbol already had a same-day sell order", Decimal("0"), None
 
     pos = positions.get(symbol)
     if pos is None:
@@ -309,7 +381,7 @@ def evaluate_row(row: Dict[str, Any], positions: Dict[str, Any], blocked_symbols
     if qty_before <= 0:
         return "SKIP", "Position qty is zero", Decimal("0"), pos
 
-    qty_to_sell = compute_qty_to_sell(qty_before, reduce_pct, action)
+    qty_to_sell = compute_qty_to_sell(qty_before, reduce_pct, action, asset_class)
     if qty_to_sell <= 0:
         return "SKIP", "Computed sell qty is zero", Decimal("0"), pos
     if qty_to_sell > qty_before:
@@ -318,13 +390,22 @@ def evaluate_row(row: Dict[str, Any], positions: Dict[str, Any], blocked_symbols
     return "READY", "Ready", qty_to_sell, pos
 
 
-def submit_sell_order(trading: TradingClient, symbol: str, qty_to_sell: Decimal) -> str:
-    request = MarketOrderRequest(
-        symbol=symbol,
-        qty=str(qty_to_sell),
-        side=OrderSide.SELL,
-        time_in_force=TimeInForce.DAY,
-    )
+def submit_sell_order(trading: TradingClient, symbol: str, qty_to_sell: Decimal, asset_class: str, action: str) -> str:
+    request_kwargs: Dict[str, Any] = {
+        "symbol": symbol,
+        "qty": str(qty_to_sell),
+        "side": OrderSide.SELL,
+        "time_in_force": TimeInForce.DAY,
+        "client_order_id": safe_client_order_id(symbol, action, today_trade_date_text()),
+    }
+
+    if asset_class == "us_option":
+        request_kwargs["qty"] = str(quantize_option_qty(qty_to_sell))
+        position_intent = option_position_intent_value()
+        if position_intent is not None:
+            request_kwargs["position_intent"] = position_intent
+
+    request = MarketOrderRequest(**request_kwargs)
     order = trading.submit_order(order_data=request)
     return as_str(get_field(order, "id"))
 
@@ -344,20 +425,22 @@ def run_executor_cycle(source: str = "manual") -> Dict[str, Any]:
 
     logger.info("Starting Executor cycle from %s dry_run=%s", source, DRY_RUN)
 
-    log_rows: List[List[Any]] = []
-    summary = {
+    summary: Dict[str, Any] = {
         "status": "ok",
         "dry_run": DRY_RUN,
         "manager_tab": MANAGER_TAB_NAME,
-        "log_tab": LOG_TAB_NAME,
         "allowed_asset_classes": sorted(ALLOWED_ASSET_CLASSES),
+        "daily_action_guard_enabled": DAILY_ACTION_GUARD_ENABLED,
+        "daily_action_tz": DAILY_ACTION_TZ,
         "rows_read": 0,
         "ready": 0,
         "orders_submitted": 0,
         "dry_run_orders": 0,
         "skipped": 0,
         "errors": 0,
+        "skip_reasons": {},
         "symbols": [],
+        "actions": [],
         "started_at": started,
         "finished_at": None,
     }
@@ -369,14 +452,13 @@ def run_executor_cycle(source: str = "manual") -> Dict[str, Any]:
         gc = gspread_client()
         spreadsheet = gc.open_by_key(GOOGLE_SHEET_ID)
         manager_ws = spreadsheet.worksheet(MANAGER_TAB_NAME)
-        log_ws = get_or_create_ws(spreadsheet, LOG_TAB_NAME, rows=100, cols=len(LOG_HEADERS))
-
         rows = load_manager_rows(manager_ws)
         summary["rows_read"] = len(rows)
 
         trading = alpaca_trading_client()
         positions = current_positions_by_symbol(trading)
         sell_blocked = open_sell_order_symbols(trading)
+        same_day_action_symbols = same_day_sell_action_symbols(trading)
 
         actions_taken = 0
         for row in rows:
@@ -386,14 +468,12 @@ def run_executor_cycle(source: str = "manual") -> Dict[str, Any]:
             asset_class = manager_asset_class(row)
             data_status = as_str(row.get("data_status")).upper()
             manager_pct = as_float(row.get("unrealized_pct"), None)
-            row_reason = as_str(row.get("reason"))
             qty_before = Decimal("0")
             qty_to_sell = Decimal("0")
             order_id = ""
-            error = ""
 
             try:
-                status, reason, qty_to_sell, pos = evaluate_row(row, positions, sell_blocked)
+                status, reason, qty_to_sell, pos = evaluate_row(row, positions, sell_blocked, same_day_action_symbols)
                 if pos is not None:
                     qty_before = decimal_qty_from_position(pos)
                     live_pct = position_unrealized_pct(pos)
@@ -402,7 +482,6 @@ def run_executor_cycle(source: str = "manual") -> Dict[str, Any]:
 
                 if status == "READY":
                     summary["ready"] += 1
-                    summary["symbols"].append(symbol)
                     if actions_taken >= MAX_ORDERS_PER_CYCLE:
                         status = "SKIP"
                         reason = "MAX_ORDERS_PER_CYCLE reached"
@@ -413,42 +492,53 @@ def run_executor_cycle(source: str = "manual") -> Dict[str, Any]:
                         summary["dry_run_orders"] += 1
                         actions_taken += 1
                     else:
-                        order_id = submit_sell_order(trading, symbol, qty_to_sell)
+                        order_id = submit_sell_order(trading, symbol, qty_to_sell, asset_class, action)
                         status = "ORDER_SUBMITTED"
                         reason = f"Submitted {action} sell order"
                         summary["orders_submitted"] += 1
                         actions_taken += 1
                         sell_blocked.add(symbol)
+                        same_day_action_symbols.add(symbol)
+
+                    summary["symbols"].append(symbol)
+                    summary["actions"].append(
+                        {
+                            "symbol": symbol,
+                            "action": action,
+                            "reduce_pct": reduce_pct,
+                            "qty_before": str(qty_before),
+                            "qty_to_sell": str(qty_to_sell),
+                            "asset_class": asset_class,
+                            "unrealized_pct": manager_pct,
+                            "data_status": data_status,
+                            "status": status,
+                            "order_id": order_id,
+                            "reason": reason,
+                        }
+                    )
                 elif status == "SKIP":
                     summary["skipped"] += 1
+                    summary["skip_reasons"][reason] = summary["skip_reasons"].get(reason, 0) + 1
 
             except Exception as exc:
                 logger.exception("Executor row failed for symbol=%s", symbol)
-                status = "ERROR"
-                reason = row_reason or "Row failed"
-                error = str(exc)
                 summary["errors"] += 1
+                summary["actions"].append(
+                    {
+                        "symbol": symbol,
+                        "action": action,
+                        "reduce_pct": reduce_pct,
+                        "qty_before": str(qty_before),
+                        "qty_to_sell": str(qty_to_sell),
+                        "asset_class": asset_class,
+                        "unrealized_pct": manager_pct,
+                        "data_status": data_status,
+                        "status": "ERROR",
+                        "order_id": "",
+                        "reason": str(exc),
+                    }
+                )
 
-            log_rows.append(
-                [
-                    iso_now(),
-                    symbol,
-                    action,
-                    reduce_pct,
-                    str(qty_before),
-                    str(qty_to_sell),
-                    asset_class,
-                    manager_pct if manager_pct is not None else "",
-                    data_status,
-                    status,
-                    order_id,
-                    reason,
-                    error,
-                    DRY_RUN,
-                ]
-            )
-
-        append_log_rows(log_ws, log_rows)
         summary["finished_at"] = iso_now()
         logger.info(
             "Finished Executor cycle from %s: rows=%s ready=%s submitted=%s dry_run=%s skipped=%s errors=%s",
@@ -460,6 +550,10 @@ def run_executor_cycle(source: str = "manual") -> Dict[str, Any]:
             summary["skipped"],
             summary["errors"],
         )
+        if summary["actions"]:
+            logger.info("Executor actions: %s", json.dumps(summary["actions"], default=str))
+        if summary["skip_reasons"]:
+            logger.info("Executor skip reasons: %s", json.dumps(summary["skip_reasons"], default=str))
 
         with state_lock:
             app_state.update(
@@ -509,8 +603,7 @@ async def executor_loop() -> None:
             logger.exception("Executor loop cycle failed; continuing after throttle")
 
         elapsed = time.monotonic() - started_monotonic
-        interval = max(EXECUTOR_LOOP_INTERVAL_SECONDS, MIN_LOOP_INTERVAL_SECONDS)
-        sleep_seconds = max(interval, MIN_LOOP_INTERVAL_SECONDS)
+        sleep_seconds = max(EXECUTOR_LOOP_INTERVAL_SECONDS, MIN_LOOP_INTERVAL_SECONDS)
         logger.info("Executor loop sleeping for %s seconds after %.2f-second cycle", sleep_seconds, elapsed)
         await asyncio.sleep(sleep_seconds)
 
@@ -519,7 +612,7 @@ async def executor_loop() -> None:
 async def startup_event() -> None:
     global loop_task
     logger.warning(
-        "Loaded Executor version=%s loop_enabled=%s interval=%s initial_delay=%s dry_run=%s allowed_asset_classes=%s manager_tab=%s log_tab=%s",
+        "Loaded Executor version=%s loop_enabled=%s interval=%s initial_delay=%s dry_run=%s allowed_asset_classes=%s manager_tab=%s daily_guard=%s daily_tz=%s",
         APP_VERSION,
         LOOP_ENABLED,
         EXECUTOR_LOOP_INTERVAL_SECONDS,
@@ -527,7 +620,8 @@ async def startup_event() -> None:
         DRY_RUN,
         sorted(ALLOWED_ASSET_CLASSES),
         MANAGER_TAB_NAME,
-        LOG_TAB_NAME,
+        DAILY_ACTION_GUARD_ENABLED,
+        DAILY_ACTION_TZ,
     )
     if LOOP_ENABLED:
         interval = max(EXECUTOR_LOOP_INTERVAL_SECONDS, MIN_LOOP_INTERVAL_SECONDS)
@@ -556,7 +650,10 @@ def root() -> Dict[str, Any]:
         "dry_run": DRY_RUN,
         "allowed_asset_classes": sorted(ALLOWED_ASSET_CLASSES),
         "manager_tab": MANAGER_TAB_NAME,
-        "log_tab": LOG_TAB_NAME,
+        "sheet_logging": False,
+        "daily_action_guard_enabled": DAILY_ACTION_GUARD_ENABLED,
+        "daily_action_tz": DAILY_ACTION_TZ,
+        "option_reduce_sell_at_least_one": OPTION_REDUCE_SELL_AT_LEAST_ONE,
     }
 
 
