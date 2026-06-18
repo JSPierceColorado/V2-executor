@@ -23,7 +23,7 @@ try:
 except Exception:  # Older alpaca-py versions may not expose this enum.
     PositionIntent = None  # type: ignore[assignment]
 
-APP_VERSION = "0.2.0-options-daily-guard-no-sheet-log"
+APP_VERSION = "0.2.1-side-normalization"
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -144,8 +144,30 @@ def get_field(obj: Any, name: str, default: Any = None) -> Any:
 
 
 def enum_value(value: Any) -> str:
+    """Return a normalized enum/string token.
+
+    alpaca-py commonly returns real Enum values, where `.value` is already
+    plain text such as `long` or `sell`. Some clients/logging paths can surface
+    stringified enum names such as `PositionSide.LONG` or `OrderSide.SELL`.
+    The executor compares against plain tokens, so normalize both shapes.
+    """
     raw = get_field(value, "value", value)
-    return as_str(raw).lower()
+    text = as_str(raw).lower()
+    if "." in text:
+        text = text.rsplit(".", 1)[-1]
+    return text
+
+
+def normalize_position_side(value: Any) -> str:
+    """Normalize Alpaca/Manager position side values to long/short tokens."""
+    side = enum_value(value).replace("-", "_").replace(" ", "_")
+    aliases = {
+        "buy": "long",
+        "bought": "long",
+        "sell": "short",
+        "sold": "short",
+    }
+    return aliases.get(side, side)
 
 
 def alpaca_trading_client() -> TradingClient:
@@ -346,7 +368,7 @@ def evaluate_row(
     symbol = as_str(row.get("symbol")).upper()
     action = as_str(row.get("action")).upper()
     data_status = as_str(row.get("data_status")).upper()
-    row_side = as_str(row.get("side")).lower()
+    row_side = normalize_position_side(row.get("side"))
     asset_class = manager_asset_class(row)
     reduce_pct = as_float(row.get("reduce_pct"), 0.0) or 0.0
 
@@ -369,7 +391,7 @@ def evaluate_row(
     if pos is None:
         return "SKIP", "Position no longer exists", Decimal("0"), None
 
-    alpaca_side = as_str(get_field(pos, "side")).lower()
+    alpaca_side = normalize_position_side(get_field(pos, "side"))
     if alpaca_side and alpaca_side != "long":
         return "SKIP", f"Alpaca position side is {alpaca_side}", Decimal("0"), pos
 
