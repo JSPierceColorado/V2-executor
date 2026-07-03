@@ -23,7 +23,7 @@ try:
 except Exception:  # Older alpaca-py versions may not expose this enum.
     PositionIntent = None  # type: ignore[assignment]
 
-APP_VERSION = "0.2.1-side-normalization"
+APP_VERSION = "0.2.2-blacklist"
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -41,6 +41,14 @@ EXECUTOR_LOOP_INTERVAL_SECONDS = int(os.getenv("EXECUTOR_LOOP_INTERVAL_SECONDS",
 EXECUTOR_LOOP_INITIAL_DELAY_SECONDS = int(os.getenv("EXECUTOR_LOOP_INITIAL_DELAY_SECONDS", "15"))
 MIN_LOOP_INTERVAL_SECONDS = int(os.getenv("MIN_LOOP_INTERVAL_SECONDS", "60"))
 DRY_RUN = os.getenv("DRY_RUN", "true").strip().lower() not in {"0", "false", "no", "off"}
+BLACKLIST_SYMBOLS = {
+    item.strip().upper()
+    for item in os.getenv(
+        "EXECUTOR_BLACKLIST_SYMBOLS",
+        os.getenv("SELL_BLACKLIST_SYMBOLS", ""),
+    ).replace("\n", ",").split(",")
+    if item.strip()
+}
 
 # This draft intentionally allows both the future plain-stock case and the current option case.
 ALLOWED_ASSET_CLASSES = {
@@ -374,6 +382,8 @@ def evaluate_row(
 
     if not symbol:
         return "SKIP", "Missing symbol", Decimal("0"), None
+    if symbol in BLACKLIST_SYMBOLS:
+        return "SKIP", "Symbol is blacklisted", Decimal("0"), None
     if action not in {"REDUCE", "EXIT"}:
         return "SKIP", f"Action is {action or 'blank'}", Decimal("0"), None
     if REQUIRE_DATA_STATUS_OK and data_status != "OK":
@@ -452,6 +462,7 @@ def run_executor_cycle(source: str = "manual") -> Dict[str, Any]:
         "dry_run": DRY_RUN,
         "manager_tab": MANAGER_TAB_NAME,
         "allowed_asset_classes": sorted(ALLOWED_ASSET_CLASSES),
+        "blacklist_symbols": sorted(BLACKLIST_SYMBOLS),
         "daily_action_guard_enabled": DAILY_ACTION_GUARD_ENABLED,
         "daily_action_tz": DAILY_ACTION_TZ,
         "rows_read": 0,
@@ -634,13 +645,14 @@ async def executor_loop() -> None:
 async def startup_event() -> None:
     global loop_task
     logger.warning(
-        "Loaded Executor version=%s loop_enabled=%s interval=%s initial_delay=%s dry_run=%s allowed_asset_classes=%s manager_tab=%s daily_guard=%s daily_tz=%s",
+        "Loaded Executor version=%s loop_enabled=%s interval=%s initial_delay=%s dry_run=%s allowed_asset_classes=%s blacklist_symbols=%s manager_tab=%s daily_guard=%s daily_tz=%s",
         APP_VERSION,
         LOOP_ENABLED,
         EXECUTOR_LOOP_INTERVAL_SECONDS,
         EXECUTOR_LOOP_INITIAL_DELAY_SECONDS,
         DRY_RUN,
         sorted(ALLOWED_ASSET_CLASSES),
+        sorted(BLACKLIST_SYMBOLS),
         MANAGER_TAB_NAME,
         DAILY_ACTION_GUARD_ENABLED,
         DAILY_ACTION_TZ,
@@ -671,6 +683,7 @@ def root() -> Dict[str, Any]:
         "loop_interval_seconds": max(EXECUTOR_LOOP_INTERVAL_SECONDS, MIN_LOOP_INTERVAL_SECONDS),
         "dry_run": DRY_RUN,
         "allowed_asset_classes": sorted(ALLOWED_ASSET_CLASSES),
+        "blacklist_symbols": sorted(BLACKLIST_SYMBOLS),
         "manager_tab": MANAGER_TAB_NAME,
         "sheet_logging": False,
         "daily_action_guard_enabled": DAILY_ACTION_GUARD_ENABLED,
